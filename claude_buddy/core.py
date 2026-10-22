@@ -14,6 +14,7 @@ into the target <account>/<org> folder and clones the transcript under a fresh i
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -266,7 +267,14 @@ def _clone_transcript(old_id: str, new_id: str, src: Path) -> None:
 
 def copy_sessions(paths: Paths, src_dir: Path, dst_dir: Path, sessions: Iterable[Session], *,
                   share_transcript: bool = False, title_suffix: str = "", dry_run: bool = False,
+                  known_ids: dict[str, str] | None = None, written: dict[str, str] | None = None,
                   log: Log = print) -> int:
+    """Copy `sessions` from src_dir to dst_dir. Returns the number of sessions copied.
+
+    `known_ids` maps source ids copied earlier to their ids in the target org, so a sub-session that
+    arrives after its parent was copied still points at the parent's copy. `written`, if given, is
+    filled with {source id: new id} for this call. Both are used by the watcher.
+    """
     if src_dir.resolve() == dst_dir.resolve():
         raise ValueError("source and target are the same org")
     sessions = list(sessions)
@@ -275,6 +283,9 @@ def copy_sessions(paths: Paths, src_dir: Path, dst_dir: Path, sessions: Iterable
 
     # New ids up front, so sub-sessions can point at their parent's copy.
     new_ids = {s.id: f"local_{uuid.uuid4()}" for s in sessions}
+    lookup = {**(known_ids or {}), **new_ids}
+    if written is not None:
+        written.update(new_ids)
 
     copied, newly_archived = 0, []
     for s in sessions:
@@ -282,11 +293,11 @@ def copy_sessions(paths: Paths, src_dir: Path, dst_dir: Path, sessions: Iterable
         new = {k: v for k, v in s.data.items() if k not in DROP_FIELDS}
         new["sessionId"] = new_local
         parent = s.parent_id
-        if parent in new_ids:
+        if parent in lookup:
             if isinstance(new.get("spawnedFrom"), dict):
-                new["spawnedFrom"] = {**new["spawnedFrom"], "sessionId": new_ids[parent]}
+                new["spawnedFrom"] = {**new["spawnedFrom"], "sessionId": lookup[parent]}
             if new.get("forkedFromSessionId"):
-                new["forkedFromSessionId"] = new_ids[parent]
+                new["forkedFromSessionId"] = lookup[parent]
         else:
             # The parent isn't being copied, so it won't exist in the target org.
             for k in PARENT_FIELDS:
@@ -316,7 +327,7 @@ def copy_sessions(paths: Paths, src_dir: Path, dst_dir: Path, sessions: Iterable
         if s.archived:
             newly_archived.append(new_local)
         copied += 1
-        log(f"  {'  - ' if parent in new_ids else '+ '}{s.title}  ({note})")
+        log(f"  {'  - ' if parent in lookup else '+ '}{s.title}  ({note})")
 
     if newly_archived and not dry_run:
         idx = dst_dir / "archived-sessions.idx"
@@ -328,6 +339,137 @@ def copy_sessions(paths: Paths, src_dir: Path, dst_dir: Path, sessions: Iterable
     if not dry_run and copied:
         log("Restart the Claude desktop app and switch to the target account/org to see them.")
     return copied
+
+
+# ---------------------------------------------------------------- live sync (watch)
+#
+# Change detection is a hash tree, like git: one sha256 per session file, and per org one sha256 over
+# the sorted session hashes. An unchanged org is a single string compare. The state lives in
+# <app data>/claude-buddy/watch-state.json:
+#   sessions  {session file path: sha256}
+#   orgs      {org folder: org hash}
+#   copied    {target org: {source session id: id of its copy}}   what the watcher mirrored, and where
+#   created   [ids the watcher wrote]                              skipped as sources, so A<->B cannot loop
+
+STATE_VERSION = 1
+
+
+def watch_state_path(paths: Paths) -> Path:
+    return paths.app_dir / "claude-buddy" / "watch-state.json"
+
+
+def load_watch_state(path: Path) -> dict:
+    data = _read_json(path, None)
+    if not isinstance(data, dict) or data.get("v") != STATE_VERSION:
+        data = {"v": STATE_VERSION, "sessions": {}, "orgs": {}, "copied": {}, "created": []}
+    for key, empty in (("sessions", {}), ("orgs", {}), ("copied", {}), ("created", [])):
+        data.setdefault(key, empty)
+    return data
+
+
+def save_watch_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(path, state)
+
+
+def file_hash(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def session_hashes(org_dir: Path) -> dict[str, str]:
+    """{session file path: sha256} for every local_*.json in the org."""
+    out = {}
+    for f in sorted(org_dir.glob("local_*.json")):
+        try:
+            out[str(f)] = file_hash(f)
+        except OSError:
+            pass  # written or removed mid-scan; the next pass sees it
+    return out
+
+
+def org_hash(hashes: dict[str, str]) -> str:
+    h = hashlib.sha256()
+    for path in sorted(hashes):
+        h.update(f"{path}\0{hashes[path]}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+def watch_once(paths: Paths, src_dir: Path, dst_dir: Path, state: dict, *, log: Log = print) -> int:
+    """One pass: mirror every session new to src_dir into dst_dir, sharing the transcript.
+
+    Returns the number of sessions copied. Mutates `state`; the caller saves it.
+    """
+    hashes = session_hashes(src_dir)
+    src_key, dst_key = str(src_dir), str(dst_dir)
+    current = org_hash(hashes)
+    if state["orgs"].get(src_key) == current:
+        return 0
+
+    if dst_key not in state["copied"]:
+        # First time this target is seen (or the state file was lost): rebuild what is already mirrored
+        # from the copiedFrom markers in the target, so nothing is copied twice.
+        seeded = {s.data["copiedFrom"]["sessionId"]: s.id for s in load_sessions(dst_dir)
+                  if isinstance(s.data.get("copiedFrom"), dict) and s.data["copiedFrom"].get("org") == src_dir.name}
+        state["copied"][dst_key] = seeded
+        state["created"] = sorted(set(state["created"]) | set(seeded.values()))
+    copied_here: dict[str, str] = state["copied"][dst_key]
+    created = set(state["created"])
+    sessions = load_sessions(src_dir)
+    new = [s for s in sessions
+           if s.id not in copied_here          # not mirrored to this target yet
+           and s.id not in created             # not something a watcher wrote (A<->B loop guard)
+           and not s.data.get("copiedFrom")]   # not a copy made by `copy` or a split of a synced session
+    # Parents before children, so a parent copied in this pass is known when its sub-session is written.
+    new = with_descendants(sessions, [s.id for s in new]) if new else []
+    new = [s for s in new if s.id not in copied_here and s.id not in created and not s.data.get("copiedFrom")]
+
+    n = 0
+    if new:
+        written: dict[str, str] = {}
+        n = copy_sessions(paths, src_dir, dst_dir, new, share_transcript=True, known_ids=copied_here,
+                          written=written, log=log)
+        copied_here.update(written)
+        state["created"] = sorted(created | set(written.values()))
+
+    for path, h in hashes.items():
+        state["sessions"][path] = h
+    for path in [p for p in state["sessions"] if p.startswith(src_key + os.sep) and p not in hashes]:
+        del state["sessions"][path]
+    state["orgs"][src_key] = current
+    return n
+
+
+def watch(paths: Paths, src_dir: Path, dst_dir: Path, *, both: bool = False, interval: float = 2.0,
+          debounce: float = 0.5, once: bool = False, state_path: Path | None = None,
+          should_stop: Callable[[], bool] | None = None, log: Log = print) -> int:
+    """Poll the source org (and the target too with `both`) and mirror new sessions as they appear.
+
+    Zero dependencies: plain polling every `interval` seconds. A change is applied `debounce` seconds
+    after it is first seen, so a session file that is still being written is read whole. Returns the
+    total number of sessions copied.
+    """
+    if src_dir.resolve() == dst_dir.resolve():
+        raise ValueError("source and target are the same org")
+    state_path = state_path or watch_state_path(paths)
+    state = load_watch_state(state_path)
+    pairs = [(src_dir, dst_dir)] + ([(dst_dir, src_dir)] if both else [])
+    total = 0
+    log(f"Watching {src_dir}{' <-> ' if both else ' -> '}{dst_dir}  (every {interval:g}s, state in {state_path})")
+    while True:
+        changed = [p for p in pairs if state["orgs"].get(str(p[0])) != org_hash(session_hashes(p[0]))]
+        if changed:
+            if debounce and not once:
+                time.sleep(debounce)
+            for s, d in changed:
+                total += watch_once(paths, s, d, state, log=log)
+            save_watch_state(state_path, state)
+        if once or (should_stop and should_stop()):
+            return total
+        time.sleep(interval)
 
 
 # ---------------------------------------------------------------- claude.ai export -> markdown

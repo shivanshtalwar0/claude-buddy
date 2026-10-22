@@ -43,6 +43,7 @@ on **macOS**, right-click the app → **Open**; on **Windows**, click **More inf
 - **Copies Claude Code sessions** from the Claude desktop app's Code tab to another account or organization, with the full conversation history, project folder, model and settings.
 - **Brings sub-sessions along.** Sessions started from another session are shown under their parent, and copying the parent copies all of them in the same structure.
 - **Keeps sessions in sync** (optional). Both organizations share one conversation, so when you hit a usage limit in one, you continue in the other and switch back later. Work in one at a time.
+- **Live sync** (command line). `watch` keeps an eye on an organization and mirrors every new session, and every new sub-session, into the other one as it appears, in sync. Nothing to copy by hand any more.
 - **Shows real names.** Organizations appear as Claude shows them, such as *Developers · Team* or *Personal · Max*, with the account email.
 - **Moves claude.ai chats too.** Claude can't import chats, so Claude Buddy turns your claude.ai data export into Markdown files you can upload to a Project in the new account.
 - **Stays on your computer.** Originals are never changed. No network requests, and no passwords, tokens or cookies are read.
@@ -86,10 +87,11 @@ python3 -m claude_buddy list                                  # accounts and org
 python3 -m claude_buddy sessions --from a575/a117              # sessions as a tree
 python3 -m claude_buddy copy --from a575/a117 --to a575/fc1a --session 02d2dd1a        # copy (with sub-sessions)
 python3 -m claude_buddy copy --from a575/a117 --to a575/fc1a --session 02d2dd1a --sync # keep in sync
+python3 -m claude_buddy watch --from a575/a117 --to a575/fc1a                          # live sync: new sessions appear in the other org
 python3 -m claude_buddy chats-to-md ~/Downloads/claude-export.zip                    # claude.ai export → Markdown
 ```
 
-`ACCOUNT/ORG` take unique prefixes of the IDs shown by `list`. More options: `--all`, `--include-archived`, `--no-children`, `--title-suffix`, `--dry-run`.
+`ACCOUNT/ORG` take unique prefixes of the IDs shown by `list`. More options: `--all`, `--include-archived`, `--no-children`, `--title-suffix`, `--dry-run`. For `watch`: `--both` (watch both directions), `--interval` (poll seconds, default 2), `--once` (one pass, for cron), `--state` (state file).
 </details>
 
 <details>
@@ -100,6 +102,7 @@ The Claude desktop app stores Code sessions in `<app data>/claude-code-sessions/
 - **Copy:** clones a session's settings into the target organization under a new ID, drops settings tied to the old organization, and clones the transcript under a new ID.
 - **Sync:** both entries point at the same transcript. The Claude app resumes a session with `--resume <transcript id>`, which continues from the latest message, so progress made in either organization shows up in both.
 - **Sub-sessions** record their parent in `spawnedFrom.sessionId` (or `forkedFromSessionId` for forks). Those links are rewritten to the copied parent.
+- **Live sync** polls the source organization and keeps a hash tree in `<app data>/claude-buddy/watch-state.json`: one sha256 per session file and one per organization over the sorted session hashes, so an unchanged organization costs a single compare. A session that is new to the source is copied in sync; a sub-session that arrives later still points at its parent's copy. Copies made by the watcher (and by `copy`) are never used as sources, so watching both directions cannot loop, and a split that rewinding a synced copy creates is left alone. No dependencies, no network.
 - **Organization names** are read from the Claude app's local cache of your claude.ai account (Snappy-compressed V8 data, decoded in pure Python).
 </details>
 
