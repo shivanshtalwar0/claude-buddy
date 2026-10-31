@@ -9,7 +9,7 @@ from pathlib import Path
 from . import __version__
 from .names import load_names
 from .core import (Paths, children_map, copy_sessions, export_to_markdown, fmt_ts, list_accounts, load_sessions,
-                   resolve_org, with_descendants)
+                   resolve_org, watch, with_descendants)
 
 
 def _paths(args) -> Paths:
@@ -77,6 +77,19 @@ def cmd_copy(args) -> None:
                   title_suffix=args.title_suffix, dry_run=args.dry_run)
 
 
+def cmd_watch(args) -> None:
+    paths = _paths(args)
+    src, dst = resolve_org(paths, args.src), resolve_org(paths, args.dst)
+    state = Path(args.state).expanduser() if args.state else None
+    try:
+        n = watch(paths, src, dst, both=args.both, interval=args.interval, once=args.once, state_path=state)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return
+    if args.once:
+        print(f"{n} new session(s) mirrored.")
+
+
 def cmd_chats(args) -> None:
     export_to_markdown(Path(args.export).expanduser(), Path(args.out).expanduser())
     print("In the other account: create a Project, upload the chats you need and each project's docs,\n"
@@ -118,6 +131,15 @@ def main(argv: list[str] | None = None) -> None:
     cp.add_argument("--title-suffix", default="")
     cp.add_argument("--dry-run", action="store_true")
     cp.set_defaults(fn=cmd_copy)
+
+    wp = sub.add_parser("watch", help="live sync: mirror new sessions into another account/org as they appear")
+    wp.add_argument("--from", dest="src", required=True, metavar="ACCT/ORG", help="uuid prefixes are fine")
+    wp.add_argument("--to", dest="dst", required=True, metavar="ACCT/ORG")
+    wp.add_argument("--both", action="store_true", help="watch both directions (copies made by the watcher never loop)")
+    wp.add_argument("--interval", type=float, default=2.0, metavar="SECONDS", help="poll interval, default 2")
+    wp.add_argument("--once", action="store_true", help="one pass, then exit (for cron or scripts)")
+    wp.add_argument("--state", metavar="FILE", help="state file, default <app data>/claude-buddy/watch-state.json")
+    wp.set_defaults(fn=cmd_watch)
 
     ex = sub.add_parser("chats-to-md", help="convert a claude.ai data export to Markdown")
     ex.add_argument("export", help="export .zip or unzipped folder")
